@@ -2,9 +2,28 @@
 name = "transformable-leg-wheel-robot"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "jax[cuda12]>=0.8.2",
+    "warp-lang>=1.10.1",
+    "playground[all]>=0.0.5",
+]
 
 [tool.uv.workspace]
 members = [
     "packages/twmr",
 ]
+
+[[tool.uv.index]]
+name = "mujoco"
+url = "https://py.mujoco.org"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv.sources]
+mujoco = { index = "mujoco" }
+warp-lang = { index = "nvidia" }
+mujoco-mjx = { git = "https://github.com/google-deepmind/mujoco", rev = "main", subdirectory = "mjx" }
