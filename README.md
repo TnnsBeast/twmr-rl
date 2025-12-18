@@ -2,6 +2,13 @@
 
 ## Git Workflow
 
+### Prerequisites
+
+- Your system must have git installed.
+- You should install [Pixi](https://pixi.sh/latest/).
+
+Although a bit confusing, we'll be using both Pixi and uv. You should think of Pixi as a package manager for any tools we'll need, and uv as the Python-only package/workspace manager. We'll mostly use Pixi to install uv, and then use uv to manage our Python packages.
+
 ### Intiail Setup
 
 ```bash
@@ -78,3 +85,12 @@ pixi run uv add "playground[all]" # test: .venv/bin/python -c "import mujoco_pla
 ```
 
 ### Setup From Clone
+
+```bash
+# Assuming you've cloned the repository
+pixi run uv sync
+source .venv/bin/activate
+python -c "import mujoco_playground"
+
+# Now you're ready to go!
+```
