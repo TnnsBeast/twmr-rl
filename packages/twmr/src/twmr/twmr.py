@@ -1,5 +1,7 @@
 from pathlib import Path
+from typing import Any
 
+import jax.numpy as jp
 from jax import Array as JaxArray
 from ml_collections import config_dict
 from mujoco import MjModel, mjx  # type: ignore
@@ -58,10 +60,33 @@ class TransformableWheelMobileRobot(MjxEnv):
         # TODO: figure out vision with the madrona batch renderer
 
     def reset(self, rng: JaxArray) -> State:
-        data = mjx_env.make_data()
+        # TODO: randomize initial state (qpos, qvel)
+
+        data = mjx_env.make_data(
+            self.mj_model,
+            # qpos=qpos,
+            # qvel=qvel,
+            impl=self.mjx_model.impl.value,
+            nconmax=self._config.nconmax,  # type: ignore
+            njmax=self._config.njmax,  # type: ignore
+        )
+
+        data = mjx.forward(self.mjx_model, data)
+
+        # TODO: initialize metrics to zero once we know what to track
+        metrics = {}
+
+        info = {"rng": rng}
+
+        reward, done = jp.zeros(2)
+
+        obs = self._get_obs(data, info)
+
         return State(data, obs, reward, done, metrics, info)
 
     def step(self, state: State, action: JaxArray) -> State: ...
+
+    def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> JaxArray: ...
 
     @property
     def xml_path(self) -> str:
