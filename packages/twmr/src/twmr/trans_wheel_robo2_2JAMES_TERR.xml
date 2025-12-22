@@ -30,7 +30,7 @@
     <material name="rear_right_wheel_1_extension_body_material" rgba="1 0 0 1" />
     <material name="rear_right_wheel_2_extension_body_material" rgba="1 0 0 1" />
     <material name="default_material" rgba="0.7 0.7 0.7 1" />
-    <hfield name="terrain_hf" file="terrain_height.bin" size="2.474 9.974 3.5 0.2" />
+    <hfield name="terrain_hf" file="terrain_height_JAMES.bin" size="2.474 9.974 3.5 0.2" />
   </asset>
 
   <worldbody>

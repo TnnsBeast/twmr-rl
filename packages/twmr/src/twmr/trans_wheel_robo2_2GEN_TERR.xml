@@ -44,7 +44,7 @@
 
 
 
-    <body name="root" pos="-4.5 0 2.030117751451163032" quat="1 0 0 0">
+    <body name="root" pos="-4.5 0 0.330117751451163032" quat="1 0 0 0">
       <freejoint name="root" />
       <site name="root_site" pos="0 0 0" quat="1 0 0 0" />
       <body name="chassis" pos="0 0 0" quat="1 0 0 0">
