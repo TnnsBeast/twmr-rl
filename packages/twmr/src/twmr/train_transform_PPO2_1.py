@@ -1,10 +1,15 @@
 
 """
 
-TO RUN (from root): python3 packages/twmr/src/twmr/train_transform_flat_PPO2_0.py
+Changes: 
+- Has camera that moves with robot
+- can work with either
+      - 5 cm step (in xml file)
+      - Or hilly terrain
+
 
 PPO training for transformable leg-wheel robot on a flat plane,
-with trans_wheel_robo2_0.xml:
+with trans_wheel_robo2_2.xml:
   - 8 torque actuators total:
       *4 wheel torque motors
       *4 leg0 extension torque motors
@@ -26,6 +31,7 @@ import os
 import subprocess
 import time
 from typing import Dict, Any, Optional, List
+from pathlib import Path
 
 import numpy as np
 
@@ -62,6 +68,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mujoco
 
+def _find_repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for p in [here.parent, *here.parents]:
+        if (p / "README.md").exists():
+            return p
+    return Path.cwd()
+
+REPO_ROOT = _find_repo_root()
+RESULTS_DIR = REPO_ROOT / "results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 print("MUJOCO_GL =", os.environ.get("MUJOCO_GL"))
 
@@ -80,7 +96,7 @@ if subprocess.run("nvidia-smi", shell=True).returncode != 0:
 
 
 # ---------------------------------------------------------------------------
-# 1) Environment around trans_wheel_robo2_0.xml
+# 1) Environment around trans_wheel_robo2_2.xml
 # ---------------------------------------------------------------------------
 
 DESIRED_ACTUATORS: List[str] = [
@@ -103,52 +119,35 @@ LEG0_JOINTS: List[str] = [
     "rear_right_wheel_0_extension_joint",
 ]
 
-from pathlib import Path
 
-def _find_repo_root(start: Path) -> Path:
-    """Walk upwards until we find a README.md (repo root marker)."""
-    for p in [start, *start.parents]:
-        if (p / "README.md").is_file():
-            return p
-    # Fallback: two levels up from this file (keeps old behavior if README not found)
-    return start.parents[2] if len(start.parents) >= 2 else start
-
-
-# Results directory at repo root (same level as README.md)
-_REPO_ROOT = _find_repo_root(Path(__file__).resolve().parent)
-RESULTS_DIR = _REPO_ROOT / "results"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _results_path(path_like) -> str:
-    """Return an absolute path inside RESULTS_DIR unless an absolute path is given."""
-    p = Path(path_like)
-    return str(p if p.is_absolute() else (RESULTS_DIR / p))
-
-
-def _resolve_xml_path(xml_path: str) -> str:
-    p = Path(xml_path)
-
-    # If the user provided an absolute path or a valid relative path from cwd, accept it.
-    if p.is_file():
-        return str(p.resolve())
-
-    # Otherwise, look relative to this python file's directory
-    here = Path(__file__).resolve().parent
-    candidates = [
-        here / p.name,                  # same folder as this script
-        here / p,                       # relative to this script folder
-        here.parent / p.name,           # one level up
-        here.parent / p,                # one level up + relative
+def _resolve_xml_path(preferred: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    names = [
+        preferred,
+        "trans_wheel_robo2_0.xml",
+        "trans_wheel_robo_2_0.xml",
+        # "trans_wheel_robo.xml",
     ]
+    candidates = []
+    for name in names:
+        if not name:
+            continue
+        candidates.append(name)
+        if not os.path.isabs(name):
+            candidates.append(os.path.join(base_dir, name))
 
-    for c in candidates:
-        if c.is_file():
-            return str(c.resolve())
+    seen = set()
+    unique_candidates = []
+    for p in candidates:
+        if p not in seen:
+            unique_candidates.append(p)
+            seen.add(p)
 
-    raise FileNotFoundError(
-        f"Could not find XML '{xml_path}'. Tried:\n" + "\n".join(str(c) for c in candidates)
-    )
+    for p in unique_candidates:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"Could not find XML. Tried: {unique_candidates}")
+
 
 class TransformableWheelFlatEnv:
     """
@@ -379,12 +378,40 @@ class TransformableWheelFlatEnv:
 
         renderer = mujoco.Renderer(self.model, height=480, width=640)
 
+        # -----------------------------
+        # FOLLOW CAMERA: isometric view of the FRONT of the robot
+        # -----------------------------
+        cam = mujoco.MjvCamera()
+        if hasattr(mujoco, "mjv_defaultFreeCamera"):
+            mujoco.mjv_defaultFreeCamera(self.model, cam)
+        else:
+            mujoco.mjv_defaultCamera(cam)
+
+        # Isometric-ish: 45° around +z, looking down ~30°.
+        # With lookat tracking the chassis, this gives a consistent "front corner" view
+        # as the robot moves (assuming "front" is roughly +x).
+        cam.azimuth = 135.0
+        cam.elevation = -30.0
+        cam.distance = 0.90
+
+        # Track chassis (fallbacks included)
+        follow_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
+        if follow_body_id < 0:
+            follow_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "root")
+        if follow_body_id < 0:
+            follow_body_id = 1  # world=0; use first body as last resort
+
         rng = jax.random.PRNGKey(0)
         if fps is None:
             fps = 1.0 / self.ctrl_dt
 
         while True:
-            renderer.update_scene(self.data)
+            # Move camera target with robot
+            lookat = np.array(self.data.xpos[follow_body_id], dtype=np.float32)
+            lookat[2] += 0.03  # aim slightly above the body center
+            cam.lookat[:] = lookat
+
+            renderer.update_scene(self.data, camera=cam)
             frames.append(renderer.render())
 
             obs_jnp = jnp.asarray(obs[None, :], dtype=jnp.float32)
@@ -397,14 +424,19 @@ class TransformableWheelFlatEnv:
                 break
 
         renderer.close()
-        video_path = _results_path(video_path)
-        media.write_video(video_path, frames, fps=fps)
+        video_path_p = Path(video_path)
+        if not video_path_p.is_absolute():
+            video_path_p = RESULTS_DIR / video_path_p
+        video_path_p.parent.mkdir(parents=True, exist_ok=True)
+
+        media.write_video(str(video_path_p), frames, fps=fps)
 
         # compute and return this trial's +x distance
         x_end = float(self.data.qpos[self.x_index])
         x_delta = x_end - x_start
 
-        print(f"Saved video to {video_path} | trial +x distance = {x_delta:.3f} m")
+        print(f"Saved video to {video_path_p} | trial +x distance = {x_delta:.3f} m")
+
         return x_delta
 
 
@@ -471,7 +503,12 @@ def make_policy_value_fn(model, action_scale: jnp.ndarray):
 
 
 def save_trial_x_plot(trial_labels: List[str], trial_x_deltas: List[float], out_path: str = "transform_ppo_trial_x_distance.png"):
-    out_path = _results_path(out_path)
+    
+    out_path_p = Path(out_path)
+    if not out_path_p.is_absolute():
+        out_path_p = RESULTS_DIR / out_path_p
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    
     plt.figure(figsize=(7, 4))
     xs = np.arange(len(trial_x_deltas))
     plt.plot(xs, trial_x_deltas, marker="o")
@@ -481,9 +518,9 @@ def save_trial_x_plot(trial_labels: List[str], trial_x_deltas: List[float], out_
     plt.title("+x Distance Traveled per Saved Video Trial")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
+    plt.savefig(str(out_path_p), dpi=150)
     plt.close()
-    print(f"Updated trial x-distance plot -> {out_path}")
+    print(f"Updated trial x-distance plot -> {out_path_p}")
 
 
 # ---------------------------------------------------------------------------
@@ -696,7 +733,7 @@ def train_ppo(
                 x_delta_trial = env.render_episode(
                     lambda p, o, r, deterministic: policy_value_fn(p, o, r, deterministic),
                     params,
-                    video_path=_results_path(video_name),
+                    video_path=video_name,
                     deterministic=True,
                     fps=1.0 / env.ctrl_dt,
                 )
@@ -712,7 +749,7 @@ def train_ppo(
     x_delta_trial = env.render_episode(
         lambda p, o, r, deterministic: policy_value_fn(p, o, r, deterministic),
         params,
-        video_path=_results_path("transform_ppo_final_best.mp4"),
+        video_path="transform_ppo_final_best.mp4",
         deterministic=True,
         fps=1.0 / env.ctrl_dt,
     )
@@ -728,7 +765,7 @@ def train_ppo(
     plt.title("PPO Training Progress (Transformable Wheel Robot on Flat Ground)")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(_results_path("transform_ppo_rewards.png"), dpi=150)
+    plt.savefig(str(RESULTS_DIR / "transform_ppo_rewards.png"), dpi=150)
     plt.close()
     print("Saved training curve to transform_ppo_rewards.png")
 
@@ -739,7 +776,7 @@ def train_ppo(
     plt.title("Distance Traveled in +x per PPO Update")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(_results_path("transform_ppo_x_distance.png"), dpi=150)
+    plt.savefig(str(RESULTS_DIR / "transform_ppo_x_distance.png"), dpi=150)
     plt.close()
     print("Saved +x distance curve to transform_ppo_x_distance.png")
 
@@ -762,7 +799,7 @@ def main():
     start_time = time.time()
     _params, returns_history, x_delta_history = train_ppo(
         env,
-        total_timesteps=4_000,
+        total_timesteps=3_000,
         rollout_steps=1024,
         gamma=0.99,
         gae_lambda=0.95,
