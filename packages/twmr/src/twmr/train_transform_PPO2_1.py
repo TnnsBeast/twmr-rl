@@ -1,6 +1,8 @@
 
 """
 
+TO RUN: python3 packages/twmr/src/twmr/train_transform_PPO2_1.py
+
 Changes: 
 - Has camera that moves with robot
 - can work with either
@@ -8,7 +10,7 @@ Changes:
       - Or hilly terrain
 
 
-PPO training for transformable leg-wheel robot on a flat plane,
+PPO training for transformable leg-wheel robot on different surfaces (change the xml_file path),
 with trans_wheel_robo2_2.xml:
   - 8 torque actuators total:
       *4 wheel torque motors
@@ -26,6 +28,12 @@ Reward:
 23-31 seconds per minibatch / PPO update
 
 """
+
+# xml_file = "trans_wheel_robo2_2FLAT.xml"
+# xml_file = "trans_wheel_robo2_2BOX.xml"
+# xml_file = "trans_wheel_robo2_2GEN_TERR.xml"
+xml_file = "trans_wheel_robo2_2JAMES_TERR.xml"
+
 
 import os
 import subprocess
@@ -124,9 +132,8 @@ def _resolve_xml_path(preferred: str) -> str:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     names = [
         preferred,
-        "trans_wheel_robo2_0.xml",
-        "trans_wheel_robo_2_0.xml",
-        # "trans_wheel_robo.xml",
+        xml_file,
+        "trans_wheel_robo.xml",
     ]
     candidates = []
     for name in names:
@@ -159,7 +166,7 @@ class TransformableWheelFlatEnv:
 
     def __init__(
         self,
-        xml_path: str = "trans_wheel_robo2_0.xml",
+        xml_path: str = xml_file,
         desired_ctrl_dt: float = 0.02,
         frame_skip: Optional[int] = None,
         max_steps: int = 1000,
@@ -789,7 +796,7 @@ def main():
 
     print("Creating TransformableWheelFlatEnv...")
     env = TransformableWheelFlatEnv(
-        xml_path="trans_wheel_robo2_0.xml",
+        xml_path=xml_file,
         desired_ctrl_dt=desired_ctrl_dt,
         frame_skip=None,
         max_steps=max_steps,
