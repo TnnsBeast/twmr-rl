@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 
-Generates a MuJoCo heightfield as a bumpy terrain, with
-controllable spatial frequency statistics (mean & std, in cycles/meter).
+Generates a square MuJoCo heightfield as a bumpy terrain, with the following adjustable parameters
+ - bump spatial frequency statistics (mean & std, in cycles/meter)
+ - bump power (accentuates bump or trough more)
+ - terrain size (side length)
 
 Outputs MuJoCo binary heightfield format:
   (int32) nrow
@@ -32,8 +34,7 @@ def bandlimited_noise_heightfield(
     seed: int | None = None,
 ) -> np.ndarray:
     """
-    Create a 2D heightfield by filtering white noise in the Fourier domain with a
-    radial Gaussian band-pass centered at freq_mean_cpm (cycles/m).
+    Create a 2D heightfield
 
     Returns float32 array shape (nrow, ncol) with arbitrary range; caller may normalize.
     """
@@ -73,7 +74,7 @@ def bandlimited_noise_heightfield(
 
 
 def normalize_01(h: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """Normalize array to [0,1] (float32)."""
+    # Normalize array to [0,1]
     hmin = float(np.min(h))
     hmax = float(np.max(h))
     rng = hmax - hmin
@@ -138,8 +139,7 @@ def main() -> None:
         seed=args.seed,
     )
 
-    # Normalize to [0,1] (MuJoCo will also normalize on load, but doing it here
-    # makes the file predictable and lets you reshape distribution with --power). :contentReference[oaicite:4]{index=4}
+    # Normalize to [0,1]
     h01 = normalize_01(h)
 
     if args.power != 1.0:
@@ -151,14 +151,6 @@ def main() -> None:
     out_path = Path(args.out)
     save_mujoco_hfield_bin(out_path, h01)
 
-    # Print the XML line you likely want (30m x 30m => radii 15, 15). :contentReference[oaicite:5]{index=5}
-    print("\nWrote:", out_path.resolve())
-    print("\nIn your XML, set the hfield size for 30m x 30m like:")
-    print('  <hfield name="terrain_hf" file="terrain_height.bin" size="15 15 ELEV_Z BASE_Z"/>')
-    print("\nNotes:")
-    print("  - ELEV_Z is the max terrain height in meters (physical bump height).")
-    print("  - BASE_Z adds thickness below the minimum height (try 0.2–1.0).")
-    print("  - Typical bump wavelength ≈ 1 / freq_mean. With freq_mean=0.4, wavelength ≈ 2.5 m.")
 
 
 if __name__ == "__main__":
