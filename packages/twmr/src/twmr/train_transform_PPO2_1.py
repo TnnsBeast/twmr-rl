@@ -5,9 +5,10 @@ TO RUN: python3 packages/twmr/src/twmr/train_transform_PPO2_1.py
 
 Changes: 
 - Has camera that moves with robot
-- can work with either
-      - 5 cm step (in xml file)
-      - Or hilly terrain
+- can work with following terrains
+      - flat infinite plane
+      - 5 cm step
+      - hilly terrain (generated with script & tunable)
 
 
 PPO training for transformable leg-wheel robot on different surfaces (change the xml_file path),
