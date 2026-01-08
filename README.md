@@ -1,5 +1,10 @@
 # Transformable Wheel Robot
 
+## DEMO
+<img src="assets/robot_step.gif" alt="Robot climbing over a step" style="width: 400px; max-width: 100%;">
+
+
+
 ## Git Workflow
 
 ### Prerequisites
@@ -9,7 +14,7 @@
 
 Although a bit confusing, we'll be using both Pixi and uv. You should think of Pixi as a package manager for any tools we'll need, and uv as the Python-only package/workspace manager. We'll mostly use Pixi to install uv, and then use uv to manage our Python packages.
 
-### Intiail Setup
+### Intial Setup
 
 ```bash
 # This only needs to be done once and you've likely done it already
