@@ -444,7 +444,7 @@ class TransformableWheelFlatEnv:
         # leg_angles = np.array([self.data.qpos[i] for i in self.leg_qpos_idx], dtype=np.float32)
         # leg_angles = np.array([self.data.qpos[i] for i in [8, 12, 16, 20]], dtype=np.float32)
 
-
+ 
         def calc_ext_cost(data):
             # Use the same normalized leg extension definition as the observation vector.
             leg_angles = np.array([data.qpos[i] for i in self.leg_qpos_idx], dtype=np.float32)
