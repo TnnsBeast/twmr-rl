@@ -1,14 +1,17 @@
 
 """
 
-TO RUN: python3 packages/twmr/src/twmr/train_transform_PPO2_1.py
+TO RUN: python3 packages/twmr/src/twmr/train_transform_PPO3_0.py
 
-Changes: 
-- Has camera that moves with robot
-- can work with following terrains
-      - flat infinite plane
-      - 5 cm step
-      - hilly terrain (generated with script & tunable)
+State space:
+- leg & wheel motor angular velocities (4) & (4), 
+- amount of leg extension -1 to 1 (4) (where 0 is fully extended, -1 is fully contracted in the CW direction and 1 is fully contracted in the CCW direction. 
+- 6 axis IMU (6)
+
+Action space:
+- Desired leg motor velocities
+- Desired wheel motor velocities
+
 
 
 PPO training for transformable leg-wheel robot on different surfaces (change the xml_file path),
@@ -21,7 +24,7 @@ with trans_wheel_robo2_2.xml:
 
 Reward:
   forward_reward = vx
-  ctrl_cost = 0.0005 * sum(action^2)
+  ctrl_cost = 0.0005 * sum(tau_cmd^2)
   leg_extension_cost = more complex, see code
   finishes using a fixed horizon
 
@@ -30,9 +33,9 @@ Reward:
 
 """
 
-# xml_file = "trans_wheel_robo2_2FLAT.xml"
+xml_file = "trans_wheel_robo2_2FLAT.xml"
 # xml_file = "trans_wheel_robo2_2BOX.xml"
-xml_file = "trans_wheel_robo2_2GEN_TERR.xml"
+# xml_file = "trans_wheel_robo2_2GEN_TERR.xml"
 # xml_file = "trans_wheel_robo2_2JAMES_TERR.xml"
 
 
@@ -128,6 +131,13 @@ LEG0_JOINTS: List[str] = [
     "rear_right_wheel_0_extension_joint",
 ]
 
+WHEEL_JOINTS: List[str] = [
+    "front_left_wheel_joint",
+    "front_right_wheel_joint",
+    "rear_left_wheel_joint",
+    "rear_right_wheel_joint",
+]
+
 
 def _resolve_xml_path(preferred: str) -> str:
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -160,7 +170,8 @@ def _resolve_xml_path(preferred: str) -> str:
 class TransformableWheelFlatEnv:
     """
     - Obs: [qpos, qvel]
-    - Action: 8D torque vector ordered as DESIRED_ACTUATORS
+    - Action: 8D desired joint angular velocities (rad/s), ordered as DESIRED_ACTUATORS
+              (a proportional controller converts velocity error -> torque)
     - Reward: forward velocity-like term - torque penalty - leg-extension penalty
     - Done: fixed horizon only
     """
@@ -206,6 +217,12 @@ class TransformableWheelFlatEnv:
         # Map actions to actuator ids
         self.nu = int(self.model.nu)
         self.actuator_ids = []
+        self.wheel_kp = 1
+        self.leg_kp = 1
+        self.wheel_vel_limit = 20 # Rad / s
+        self.leg_vel_limit = 10 # Rad / s
+
+        
 
 
 
@@ -229,47 +246,137 @@ class TransformableWheelFlatEnv:
         self.action_dim = len(self.actuator_ids)
         if self.action_dim != 8:
             raise RuntimeError(f"Expected 8 desired actuators, got {self.action_dim}.")
+        # -------------------------------------------------------------------
+        # Actuator limits (torque) and policy action scaling (desired velocity)
+        #
+        # In this environment:
+        #   - The MuJoCo actuators are TORQUE actuators (ctrl = torque, N·m).
+        #   - The POLICY will output DESIRED JOINT ANGULAR VELOCITIES (rad/s).
+        #   - A proportional controller converts velocity error -> torque:
+        #         tau_cmd = Kp * (v_des - v_meas)
+        #     and we clip tau_cmd to the actuator ctrlrange (torque limits).
+        # -------------------------------------------------------------------
 
-        # Per-actuator ctrlrange scale (used by the policy squashing)
+        # Per-actuator torque limits from MuJoCo ctrlrange (N·m).
         ctrlranges = np.asarray(self.model.actuator_ctrlrange, dtype=np.float32)
-        scales = []
+        torque_limits: List[float] = []
         for aid in self.actuator_ids:
             lo, hi = float(ctrlranges[aid, 0]), float(ctrlranges[aid, 1])
-            s = max(abs(lo), abs(hi))
-            scales.append(s if s > 0.0 else 1.0)
-        self.action_scale = np.asarray(scales, dtype=np.float32)
+            tlim = max(abs(lo), abs(hi))
+            torque_limits.append(tlim if tlim > 0.0 else 1.0)
+        # torque_limit is aligned with action indices (same order as DESIRED_ACTUATORS)
+        self.torque_limit = np.asarray(torque_limits, dtype=np.float32)
 
-        self.full_ext_angle = 2.237 # Angle in radians where the leg is fully extended
+        # Policy outputs desired joint angular velocities (rad/s).
+        # These limits should reflect what your real motors can reach.
+        self.action_scale = np.asarray(
+            [self.wheel_vel_limit] * 4 + [self.leg_vel_limit] * 4, dtype=np.float32
+        )
 
-        # Leg qpos indices + max angle for normalization
-        self.leg_qpos_idx = []
-        max_abs = []
+        # Proportional gains mapping velocity error -> torque (N·m / (rad/s)).
+        self.kp = np.asarray([self.wheel_kp] * 4 + [self.leg_kp] * 4, dtype=np.float32)
+
+        # -------------------------------------------------------------------
+        # Indices + normalization for "real-robot" observation vector
+        #   Obs = [wheel_omega(4), leg_omega(4), leg_ext_norm(4), imu_acc(3), imu_gyro(3)]
+        # where leg_ext_norm is mapped to [-1, 1] using the joint's range:
+        #   0   -> fully extended (midpoint of range)
+        #   -1  -> fully contracted in CW direction (lower range)
+        #   +1  -> fully contracted in CCW direction (upper range)
+        # -------------------------------------------------------------------
+
+        # Wheel angular velocity DOF indices (qvel)
+        self.wheel_qvel_idx: List[int] = []
+        for jname in WHEEL_JOINTS:
+            jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            if jid < 0:
+                raise RuntimeError(f"Wheel joint '{jname}' not found in model. Check XML.")
+            self.wheel_qvel_idx.append(int(self.model.jnt_dofadr[jid]))
+
+        # Leg extension joint indices (qpos + qvel) + per-joint normalization params
+        self.leg_qpos_idx: List[int] = []
+        self.leg_qvel_idx: List[int] = []
+        centers: List[float] = []
+        half_ranges: List[float] = []
+
         for jname in LEG0_JOINTS:
             jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jname)
             if jid < 0:
                 raise RuntimeError(f"Leg joint '{jname}' not found in model. Check XML.")
-            adr = int(self.model.jnt_qposadr[jid])
-            self.leg_qpos_idx.append(adr)
+            self.leg_qpos_idx.append(int(self.model.jnt_qposadr[jid]))
+            self.leg_qvel_idx.append(int(self.model.jnt_dofadr[jid]))
 
-            # Use joint range if available; fallback to 1.0
             if int(self.model.jnt_limited[jid]) == 1:
                 lo, hi = float(self.model.jnt_range[jid, 0]), float(self.model.jnt_range[jid, 1])
-                max_abs.append(max(abs(lo), abs(hi)))
-        self.leg_max_angle = float(max(max_abs) if len(max_abs) else 1.0)
+                center = 0.5 * (lo + hi)      # "fully extended" reference
+                half = 0.5 * (hi - lo)        # contraction span
+                if half <= 1e-8:
+                    half = 1.0
+            else:
+                center = 0.0
+                half = 1.0
 
+            centers.append(center)
+            half_ranges.append(half)
+
+        self.leg_center = np.asarray(centers, dtype=np.float32)
+        self.leg_half_range = np.asarray(half_ranges, dtype=np.float32)
+
+        # IMU sensor slices (accelerometer + gyro at root_site)
+        # NOTE: these depend on the XML defining sensors named 'root_acc' and 'root_gyro'.
+        self.acc_slice = None
+        self.gyro_slice = None
+        try:
+            acc_sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "root_acc")
+            gyro_sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "root_gyro")
+            if acc_sid >= 0 and gyro_sid >= 0:
+                acc_adr = int(self.model.sensor_adr[acc_sid]); acc_dim = int(self.model.sensor_dim[acc_sid])
+                gyro_adr = int(self.model.sensor_adr[gyro_sid]); gyro_dim = int(self.model.sensor_dim[gyro_sid])
+                if acc_dim == 3 and gyro_dim == 3:
+                    self.acc_slice = slice(acc_adr, acc_adr + 3)
+                    self.gyro_slice = slice(gyro_adr, gyro_adr + 3)
+                else:
+                    print(f"[Env] WARNING: IMU sensor dims unexpected: acc_dim={acc_dim}, gyro_dim={gyro_dim}")
+            else:
+                print("[Env] WARNING: IMU sensors 'root_acc'/'root_gyro' not found in XML; IMU obs will be zeros.")
+        except Exception as e:
+            print(f"[Env] WARNING: Failed to resolve IMU sensors: {e}. IMU obs will be zeros.")
         print(f"[Env] Loaded XML: {xml_path}")
         print(f"[Env] sim_dt={self.sim_dt:.6f}, frame_skip={self.frame_skip}, ctrl_dt={self.ctrl_dt:.6f}")
-        print("[Env] Action order (policy outputs) -> actuator name:")
+        print("[Env] Action order (policy outputs desired velocities) -> actuator name:")
         for i, name in enumerate(DESIRED_ACTUATORS):
-            print(f"   a[{i}] -> {name}  (scale≈{self.action_scale[i]:.3f} N·m)")
-        print(f"[Env] leg_qpos_idx={self.leg_qpos_idx}, leg_max_angle≈{self.leg_max_angle:.3f} rad")
+            print(
+                f"   a[{i}] -> {name}  "
+                f"(vel_limit≈{self.action_scale[i]:.3f} rad/s, "
+                f"torque_limit≈{self.torque_limit[i]:.3f} N·m, "
+                f"Kp≈{self.kp[i]:.3f})"
+            )
+        print(f"[Env] wheel_qvel_idx={self.wheel_qvel_idx}")
+        print(f"[Env] leg_qpos_idx={self.leg_qpos_idx}, leg_qvel_idx={self.leg_qvel_idx}")
+        print(f"[Env] leg_center={self.leg_center.tolist()}, leg_half_range={self.leg_half_range.tolist()}")
 
         self.step_count = 0
 
     def _get_obs(self) -> np.ndarray:
-        qpos = np.array(self.data.qpos, dtype=np.float32)
-        qvel = np.array(self.data.qvel, dtype=np.float32)
-        return np.concatenate([qpos, qvel], axis=0)
+        # Wheel + leg motor angular velocities (rad/s)
+        wheel_omega = np.array([self.data.qvel[i] for i in self.wheel_qvel_idx], dtype=np.float32)
+        leg_omega = np.array([self.data.qvel[i] for i in self.leg_qvel_idx], dtype=np.float32)
+
+        # Leg extension normalized to [-1, 1] using joint-range midpoint as "fully extended"
+        leg_angles = np.array([self.data.qpos[i] for i in self.leg_qpos_idx], dtype=np.float32)
+        leg_ext_norm = (leg_angles - self.leg_center) / self.leg_half_range
+        leg_ext_norm = np.clip(leg_ext_norm, -1.0, 1.0).astype(np.float32)
+
+        # 6-axis IMU (accelerometer + gyro)
+        if self.acc_slice is not None and self.gyro_slice is not None:
+            sens = np.array(self.data.sensordata, dtype=np.float32)
+            acc = sens[self.acc_slice]
+            gyro = sens[self.gyro_slice]
+        else:
+            acc = np.zeros((3,), dtype=np.float32)
+            gyro = np.zeros((3,), dtype=np.float32)
+
+        return np.concatenate([wheel_omega, leg_omega, leg_ext_norm, acc, gyro], axis=0)
 
     def reset(self) -> np.ndarray:
         mujoco.mj_resetData(self.model, self.data)
@@ -285,17 +392,29 @@ class TransformableWheelFlatEnv:
         action = np.asarray(action, dtype=np.float32)
         if action.shape != (self.action_dim,):
             raise ValueError(f"Expected action shape ({self.action_dim},), got {action.shape}")
-
-        # Clip to per-actuator ctrlrange
-        action = np.clip(action, -self.action_scale, self.action_scale)
+        # Policy action = desired joint angular velocities (rad/s), ordered as:
+        #   [wheel_vel_des(4), leg_vel_des(4)]
+        v_des = np.clip(action, -self.action_scale, self.action_scale).astype(np.float32)
 
         x_before = float(self.data.qpos[self.x_index])
         y_before = float(self.data.qpos[self.y_index])
 
-        # Fill full ctrl vector in model actuator order
+        # Measured joint angular velocities from the simulator (rad/s), in the same order.
+        v_meas_wheels = np.array([self.data.qvel[i] for i in self.wheel_qvel_idx], dtype=np.float32)
+        v_meas_legs = np.array([self.data.qvel[i] for i in self.leg_qvel_idx], dtype=np.float32)
+        v_meas = np.concatenate([v_meas_wheels, v_meas_legs], axis=0)
+
+        # Proportional velocity controller: tau_cmd = Kp * (v_des - v_meas)
+        vel_err = v_des - v_meas
+        tau_cmd = self.kp * vel_err
+
+        # Clip commanded torques to actuator limits (N·m).
+        tau_cmd = np.clip(tau_cmd, -self.torque_limit, self.torque_limit).astype(np.float32)
+
+        # Fill full ctrl vector in MuJoCo actuator order (ctrl = torque for these actuators)
         ctrl_full = np.zeros((self.nu,), dtype=np.float32)
         for i, aid in enumerate(self.actuator_ids):
-            ctrl_full[aid] = action[i]
+            ctrl_full[aid] = tau_cmd[i]
 
         self.data.ctrl[:] = ctrl_full
         for _ in range(self.frame_skip):
@@ -314,7 +433,8 @@ class TransformableWheelFlatEnv:
         sideways_cost = 0.03 * (vy ** 2) / (vx ** 2 + vy ** 2 + 1e-8)
 
         # Penalize large torques
-        ctrl_cost = 0.0005 * float(np.sum(np.square(action)))
+        # Penalize large applied torques (not desired velocities)
+        ctrl_cost = 0.0005 * float(np.sum(np.square(tau_cmd)))
 
         # -1.047 3.427
         # a = angles + 1.047
@@ -325,16 +445,22 @@ class TransformableWheelFlatEnv:
         # leg_angles = np.array([self.data.qpos[i] for i in [8, 12, 16, 20]], dtype=np.float32)
 
 
-        def calc_ext_cost(data,full_ext_angle):
-            leg_angles = np.array([data.qpos[i] for i in [8, 12, 16, 20]], dtype=np.float32)
-            leg_omegas = np.array([data.qvel[i] for i in [8, 12, 16, 20]], dtype=np.float32)
-            leg_angles_normalized = np.clip(((leg_angles - 1.19) / full_ext_angle), -1, 1)  # [-1, 1]
-            dist_from_closed = 1 - np.abs(leg_angles_normalized)
-            angular_vel_dir_cost = (-np.sign(leg_angles_normalized) * leg_omegas * dist_from_closed)
-            leg_extension_cost = 1e-3 * np.sqrt(np.sum(np.square(angular_vel_dir_cost + 2 * dist_from_closed)))
-            return leg_extension_cost, leg_angles
-        
-        leg_extension_cost, leg_angles = calc_ext_cost(self.data,self.full_ext_angle)
+        def calc_ext_cost(data):
+            # Use the same normalized leg extension definition as the observation vector.
+            leg_angles = np.array([data.qpos[i] for i in self.leg_qpos_idx], dtype=np.float32)
+            leg_omegas = np.array([data.qvel[i] for i in self.leg_qvel_idx], dtype=np.float32)
+
+            leg_ext_norm = (leg_angles - self.leg_center) / self.leg_half_range
+            leg_ext_norm = np.clip(leg_ext_norm, -1.0, 1.0)  # [-1, 1]
+
+            dist_from_closed = 1.0 - np.abs(leg_ext_norm)
+            angular_vel_dir_cost = (-np.sign(leg_ext_norm) * leg_omegas * dist_from_closed)
+            leg_extension_cost = 1e-3 * np.sqrt(
+                np.sum(np.square(angular_vel_dir_cost + 2.0 * dist_from_closed))
+            )
+            return float(leg_extension_cost), leg_angles, leg_ext_norm
+
+        leg_extension_cost, leg_angles, leg_ext_norm = calc_ext_cost(self.data)
         retract_err = []
 
 
@@ -364,6 +490,10 @@ class TransformableWheelFlatEnv:
             "x_after": x_after,
             "forward_reward": forward_reward,
             "ctrl_cost": ctrl_cost,
+            "v_des": v_des,
+            "v_meas": v_meas,
+            "vel_err": vel_err,
+            "tau_cmd": tau_cmd,
             "leg_extension_cost": leg_extension_cost,
             "leg_angles": leg_angles,
             "leg_extension_frac": retract_err,
@@ -807,7 +937,7 @@ def main():
     start_time = time.time()
     _params, returns_history, x_delta_history = train_ppo(
         env,
-        total_timesteps=1_200_000,
+        total_timesteps=200_000,
         rollout_steps=1024,
         gamma=0.99,
         gae_lambda=0.95,
