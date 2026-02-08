@@ -1114,7 +1114,7 @@ wheels = [
 
 [[package]]
 name = "mediapy"
-version = "1.2.5"
+version = "1.2.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ipython" },
@@ -1122,9 +1122,9 @@ dependencies = [
     { name = "numpy" },
     { name = "pillow" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a5/65/1f69540942fcae6df1df14fcd87100827f079cf94e7d6dd4bc89c4602e1c/mediapy-1.2.5.tar.gz", hash = "sha256:2c7a4c51704b26642737190a6e5fbea8260b027fde9d99c644a670255aae860f", size = 28076, upload-time = "2025-12-17T17:37:03.123Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b3/eb/8a0499fb1a2f373f97e2b4df91797507c3971c42c59f1610bed090c57ddc/mediapy-1.2.6.tar.gz", hash = "sha256:2c866cfa0a170213f771b1dd5584a2e82d8d0dc0fa94982f83e29aae27e49c83", size = 28143, upload-time = "2026-02-03T10:29:31.104Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2b/eb/acb955d5d24a70bbdfc365475364d54acd10feedab0121ebe04f312ba828/mediapy-1.2.5-py3-none-any.whl", hash = "sha256:517a7c7411742a68790671a12977d5d54a5a5f85d8b77720031fe15d5a278893", size = 27431, upload-time = "2025-12-17T17:37:01.947Z" },
+    { url = "https://files.pythonhosted.org/packages/37/8c/52f0299f1675cdfa1ab39a6028a2e5adf9032ae1118c9895c84b08af162b/mediapy-1.2.6-py3-none-any.whl", hash = "sha256:0a0ea00eb0da83c3c54d588b49c49a41ba456174aa33e530ffe13e17269c9072", size = 27494, upload-time = "2026-02-03T10:29:30.245Z" },
 ]
 
 [[package]]
