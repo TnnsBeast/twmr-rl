@@ -1,3 +1,6 @@
+# project specific ignores
+logs/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
