@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+
+log_dir="sandbox/neil/logs"
+mkdir -p "$log_dir"
+ts=$(date +"%Y%m%d_%H%M%S")
+log_file="$log_dir/tallobs_train_$ts.log"
+echo "Logging to $log_file"
+
+PYTHONUNBUFFERED=1 ./.venv/bin/python sandbox/neil/train_ppo_lstm.py \
+  --model sandbox/neil/models/trans_wheel_robo2_2BOX_CLY_TALL.xml \
+  --rollout-steps 1024 \
+  --learning-rate 3e-4 \
+  --ent-coef 0.01 \
+  --control-cost 5e-4 \
+  --extension-penalty 1e-4 \
+  --success-bonus 30 \
+  --post-success-penalty 0.02 \
+  --gate-bias 0.4 \
+  --gate-acc-scale 1.0 \
+  --gate-gyro-scale 1.0 \
+  --gate-stall-scale 0.5 \
+  --gate-smooth 0.2 \
+  --total-timesteps 1500000 \
+  |& tee "$log_file"
