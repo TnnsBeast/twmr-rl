@@ -21,6 +21,15 @@ import os
 import time
 import warnings
 
+# Configure rendering/backend env before importing MuJoCo/JAX.
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+_xla_flags = os.environ.get("XLA_FLAGS", "")
+if "--xla_gpu_triton_gemm_any=True" not in _xla_flags:
+    _xla_flags = f"{_xla_flags} --xla_gpu_triton_gemm_any=True".strip()
+os.environ["XLA_FLAGS"] = _xla_flags
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import jax.numpy as jp
 import mediapy as media
@@ -45,13 +54,6 @@ try:
     import wandb
 except ImportError:
     wandb = None
-
-
-xla_flags = os.environ.get("XLA_FLAGS", "")
-xla_flags += " --xla_gpu_triton_gemm_any=True"
-os.environ["XLA_FLAGS"] = xla_flags
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["MUJOCO_GL"] = "egl"
 
 # Ignore the info logs from brax
 logging.set_verbosity(logging.WARNING)
@@ -100,6 +102,17 @@ _SEED = flags.DEFINE_integer("seed", 1, "Random seed")
 _NUM_TIMESTEPS = flags.DEFINE_integer("num_timesteps", 1_000_000, "Number of timesteps")
 _NUM_VIDEOS = flags.DEFINE_integer(
     "num_videos", 1, "Number of videos to record after training."
+)
+_ROLLOUT_CAMERA = flags.DEFINE_string(
+    "rollout_camera",
+    None,
+    "Optional camera name/id for rollout rendering (default: free camera).",
+)
+_ROLLOUT_WIDTH = flags.DEFINE_integer(
+    "rollout_width", 640, "Rollout video width."
+)
+_ROLLOUT_HEIGHT = flags.DEFINE_integer(
+    "rollout_height", 480, "Rollout video height."
 )
 _NUM_EVALS = flags.DEFINE_integer("num_evals", 5, "Number of evaluations")
 _REWARD_SCALING = flags.DEFINE_float("reward_scaling", 0.1, "Reward scaling")
@@ -161,8 +174,37 @@ _TRAINING_METRICS_STEPS = flags.DEFINE_integer(
     " experiences slowdown.",
 )
 
+_TWMR_ENV_NAME = "TransformableWheelMobileRobot"
+
+
+def _get_twmr_ppo_config() -> config_dict.ConfigDict:
+    """Returns PPO defaults tuned for TWMR iteration speed and stability."""
+    if _VISION.value:
+        cfg = dm_control_suite_params.brax_vision_ppo_config(_TWMR_ENV_NAME, _IMPL.value)
+    else:
+        cfg = dm_control_suite_params.brax_ppo_config(_TWMR_ENV_NAME, _IMPL.value)
+
+    cfg.num_timesteps = 5_000_000
+    cfg.num_evals = 10
+    cfg.reward_scaling = 10.0
+    cfg.episode_length = 1000
+    cfg.normalize_observations = True
+    cfg.action_repeat = 1
+    cfg.unroll_length = 20
+    cfg.num_minibatches = 16
+    cfg.num_updates_per_batch = 8
+    cfg.discounting = 0.995
+    cfg.learning_rate = 1e-3
+    cfg.entropy_cost = 1e-2
+    cfg.num_envs = 1024
+    cfg.num_eval_envs = 64
+    cfg.batch_size = 512
+    return cfg
+
 
 def get_rl_config(env_name: str) -> config_dict.ConfigDict:
+    if env_name == _TWMR_ENV_NAME:
+        return _get_twmr_ppo_config()
     if env_name in mujoco_playground.manipulation._envs:
         if _VISION.value:
             return manipulation_params.brax_vision_ppo_config(env_name, _IMPL.value)
@@ -305,12 +347,25 @@ def main(argv):
         # Convert to absolute path
         ckpt_path = epath.Path(_LOAD_CHECKPOINT_PATH.value).resolve()
         if ckpt_path.is_dir():
-            latest_ckpts = list(ckpt_path.glob("*"))
-            latest_ckpts = [ckpt for ckpt in latest_ckpts if ckpt.is_dir()]
-            latest_ckpts.sort(key=lambda x: int(x.name))
-            latest_ckpt = latest_ckpts[-1]
-            restore_checkpoint_path = latest_ckpt
-            print(f"Restoring from: {restore_checkpoint_path}")
+            if ckpt_path.name.isdigit():
+                # Accept explicit checkpoint step directories directly.
+                restore_checkpoint_path = ckpt_path
+                print(f"Restoring from checkpoint: {restore_checkpoint_path}")
+            else:
+                latest_ckpts = [
+                    ckpt
+                    for ckpt in ckpt_path.glob("*")
+                    if ckpt.is_dir() and ckpt.name.isdigit()
+                ]
+                if not latest_ckpts:
+                    raise ValueError(
+                        "Checkpoint directory has no numeric step subdirectories: "
+                        f"{ckpt_path}"
+                    )
+                latest_ckpts.sort(key=lambda x: int(x.name))
+                latest_ckpt = latest_ckpts[-1]
+                restore_checkpoint_path = latest_ckpt
+                print(f"Restoring from: {restore_checkpoint_path}")
         else:
             restore_checkpoint_path = ckpt_path
             print(f"Restoring from checkpoint: {restore_checkpoint_path}")
@@ -374,6 +429,12 @@ def main(argv):
 
     times = [time.monotonic()]
 
+    def _find_metric(metrics, candidates):
+        for key in candidates:
+            if key in metrics:
+                return key, metrics[key]
+        return None, None
+
     # Progress function for logging
     def progress(num_steps, metrics):
         times.append(time.monotonic())
@@ -388,7 +449,44 @@ def main(argv):
                 writer.add_scalar(key, value, num_steps)
             writer.flush()
         if _RUN_EVALS.value:
-            print(f"{num_steps}: reward={metrics['eval/episode_reward']:.3f}")
+            reward_key, reward_value = _find_metric(metrics, ("eval/episode_reward",))
+            success_key, success_value = _find_metric(
+                metrics,
+                (
+                    "eval/episode_task/success",
+                    "eval/episode_success",
+                    "eval/success_rate",
+                    "task/success",
+                ),
+            )
+            root_x_key, root_x_value = _find_metric(
+                metrics,
+                (
+                    "eval/episode_task/root_x",
+                    "eval/episode_root_x",
+                    "task/root_x",
+                ),
+            )
+            dist_key, dist_value = _find_metric(
+                metrics,
+                (
+                    "eval/episode_task/distance_to_success",
+                    "eval/episode_distance_to_success",
+                    "task/distance_to_success",
+                ),
+            )
+
+            parts = []
+            if reward_key is not None:
+                parts.append(f"reward={float(reward_value):.3f}")
+            if success_key is not None:
+                parts.append(f"success={float(success_value):.3f}")
+            if root_x_key is not None:
+                parts.append(f"root_x={float(root_x_value):.3f}")
+            if dist_key is not None:
+                parts.append(f"dist_to_success={float(dist_value):.3f}")
+            if parts:
+                print(f"{num_steps}: " + ", ".join(parts))
         if _LOG_TRAINING_METRICS.value:
             if "episode/sum_reward" in metrics:
                 print(f"{num_steps}: mean episode reward={metrics['episode/sum_reward']:.3f}")
@@ -509,9 +607,21 @@ def main(argv):
     scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
     for i, rollout in enumerate(trajectories):
         traj = rollout[::render_every]
-        frames = eval_env.render(traj, height=480, width=640, scene_option=scene_option)
-        media.write_video(f"rollout{i}.mp4", frames, fps=fps)
-        print(f"Rollout video saved as 'rollout{i}.mp4'.")
+        try:
+            frames = eval_env.render(
+                traj,
+                height=_ROLLOUT_HEIGHT.value,
+                width=_ROLLOUT_WIDTH.value,
+                camera=_ROLLOUT_CAMERA.value,
+                scene_option=scene_option,
+            )
+            media.write_video(f"rollout{i}.mp4", frames, fps=fps)
+            print(f"Rollout video saved as 'rollout{i}.mp4'.")
+        except Exception as err:  # pragma: no cover - best-effort rollout export.
+            print(
+                "Rollout export failed; keeping training/checkpoints and continuing. "
+                f"rollout={i}, error={err}"
+            )
 
 
 def run():
