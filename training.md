@@ -14,6 +14,12 @@ The job runs `scripts/full_curriculum.py`, which includes:
 
 ## Submit the Job
 
+> [!IMPORTANT]
+> Before running the job, update `jobs/train_full_curriculum.sbatch` for your setup:
+> - Line 11: set `#SBATCH --mail-user=...` to your email address.
+> - Line 15: set `cd ...` to the path of your local clone on the cluster.
+> - Review other cluster-specific `#SBATCH` settings (partition, GPU type, wall time, memory) as needed.
+
 From repo root:
 
 ```bash
