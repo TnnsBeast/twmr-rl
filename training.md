@@ -40,6 +40,12 @@ Another example (continue from a known checkpoint):
 sbatch jobs/train_full_curriculum.sbatch -- --dual_start_checkpoint_path=/path/to/checkpoints
 ```
 
+Bridge fallback example (continue even if bridge has no promoted stage):
+
+```bash
+sbatch jobs/train_full_curriculum.sbatch -- --bridge_no_promotion_action=fallback_stagec
+```
+
 ## Monitor
 
 ```bash
@@ -83,9 +89,11 @@ The full-curriculum run is a checkpoint-handoff pipeline across multiple PPO tra
 2. Stage B (`stageB-box-easy`): resumes from Stage A and trains on an easier obstacle: `xml_variant=box`, `obstacle_height=0.03`, `obstacle_x_position=0.55`, `obstacle_half_length=0.15`, `success_x_margin=0.08`.
 3. Stage C (`stageC-box-target`): resumes from Stage B and trains on the target harder obstacle: `xml_variant=box`, `obstacle_height=0.06`, `obstacle_x_position=0.60`, `obstacle_half_length=0.20`, `success_x_margin=0.10`.
 4. Optional bridge curriculum: runs intermediate box settings (default `mode=height` with heights `0.045,0.05,0.055,0.06`), evaluates each bridge stage, and only promotes checkpoints that pass success-rate gates.
-5. Dual-obstacle phase (`box_dual`): starts from the selected bridge checkpoint (or Stage C if bridge is skipped), enables a second obstacle, and trains with obstacle randomization ranges for obstacle position and obstacle gap.
-6. Post-training evaluation: runs `scripts/eval_twmr_checkpoint.py` on the final dual checkpoint and reports `success_rate`, `mean_return`, and `mean_x_distance`.
-7. Deterministic render run: loads the final checkpoint and runs `train_jax_ppo.py` with `--num_timesteps=0` to generate rollout videos without additional learning.
+5. If bridge runs but produces no promoted stage, full-curriculum now fails fast by default (`--bridge_no_promotion_action=stop`) instead of silently continuing from a failed bridge checkpoint.
+6. Dual-obstacle phase (`box_dual`): starts from the selected promoted bridge checkpoint (or Stage C if bridge is skipped), enables a second obstacle, and trains with obstacle randomization ranges for obstacle position and obstacle gap.
+7. You can override bridge failure behavior with `--bridge_no_promotion_action=fallback_stagec`, `fallback_stageb`, or `continue_last` (legacy behavior).
+8. Post-training evaluation: runs `scripts/eval_twmr_checkpoint.py` on the final dual checkpoint and reports `success_rate`, `mean_return`, and `mean_x_distance`.
+9. Deterministic render run: loads the final checkpoint and runs `train_jax_ppo.py` with `--num_timesteps=0` to generate rollout videos without additional learning.
 
 With the current full-curriculum defaults in this repo:
 - Stage A/B/C: 1,000,000 timesteps per stage

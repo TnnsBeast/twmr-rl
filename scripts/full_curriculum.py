@@ -110,6 +110,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--bridge_rollout_width", type=int, default=640)
     parser.add_argument("--bridge_rollout_height", type=int, default=480)
     parser.add_argument(
+        "--bridge_no_promotion_action",
+        choices=["stop", "fallback_stagec", "fallback_stageb", "continue_last"],
+        default="stop",
+        help=(
+            "Behavior when bridge produces no promoted stage: "
+            "'stop' (default) fails fast; "
+            "'fallback_stagec' starts dual from Stage C ckpt; "
+            "'fallback_stageb' starts dual from Stage B ckpt; "
+            "'continue_last' keeps legacy behavior and starts dual from last "
+            "bridge stage even if unpromoted."
+        ),
+    )
+    parser.add_argument(
         "--bridge_manifest_path",
         default=None,
         help="Optional explicit path for bridge manifest JSON.",
@@ -233,7 +246,12 @@ def _choose_bridge_ckpt(bridge_manifest: dict[str, Any]) -> tuple[Path, dict[str
     if not stages:
         raise RuntimeError("Bridge manifest contains no stage records.")
     promoted = [stage for stage in stages if bool(stage.get("promoted"))]
-    chosen = promoted[-1] if promoted else stages[-1]
+    if not promoted:
+        stop_reason = str(bridge_manifest.get("stop_reason", "")).strip()
+        if stop_reason:
+            raise RuntimeError(f"No promoted bridge stage found. {stop_reason}")
+        raise RuntimeError("No promoted bridge stage found.")
+    chosen = promoted[-1]
     ckpt_dir = chosen.get("ckpt_dir")
     if not ckpt_dir:
         raise RuntimeError("Selected bridge stage has no ckpt_dir.")
@@ -324,14 +342,18 @@ def main() -> int:
         stagec_ckpt = _find_stage_ckpt(phase3_manifest, STAGE_C)
 
     # Determine dual start checkpoint.
+    bridge_selection_source = "unset"
+    bridge_selection_note = ""
     if args.dual_start_checkpoint_path is not None:
         dual_start_ckpt = Path(args.dual_start_checkpoint_path).resolve()
         bridge_chosen_stage: dict[str, Any] | None = None
         bridge_manifest_for_summary: dict[str, Any] | None = None
+        bridge_selection_source = "explicit_dual_start_checkpoint"
     elif args.skip_bridge:
         dual_start_ckpt = stagec_ckpt
         bridge_chosen_stage = None
         bridge_manifest_for_summary = None
+        bridge_selection_source = "skip_bridge_stagec"
     else:
         bridge_initial_ckpt = stageb_ckpt if args.bridge_initial_stage == STAGE_B else stagec_ckpt
         bridge_cmd = [
@@ -371,9 +393,72 @@ def main() -> int:
             dual_start_ckpt = Path("<bridge_ckpt_dir>")
             bridge_chosen_stage = None
             bridge_manifest_for_summary = None
+            bridge_selection_source = "bridge_dry_run_placeholder"
         else:
             bridge_manifest_for_summary = _read_json(bridge_manifest_path)
-            dual_start_ckpt, bridge_chosen_stage = _choose_bridge_ckpt(bridge_manifest_for_summary)
+            try:
+                dual_start_ckpt, bridge_chosen_stage = _choose_bridge_ckpt(
+                    bridge_manifest_for_summary
+                )
+                bridge_selection_source = "bridge_promoted"
+            except RuntimeError as err:
+                bridge_selection_note = str(err)
+                no_promotion_action = args.bridge_no_promotion_action
+                if no_promotion_action == "stop":
+                    raise RuntimeError(
+                        "Bridge produced no promoted checkpoint and "
+                        "--bridge_no_promotion_action=stop. "
+                        f"Bridge manifest: {bridge_manifest_path}. "
+                        "Use --bridge_no_promotion_action=fallback_stagec, "
+                        "--bridge_no_promotion_action=fallback_stageb, or "
+                        "--bridge_no_promotion_action=continue_last to proceed."
+                    ) from err
+                if no_promotion_action == "fallback_stagec":
+                    dual_start_ckpt = stagec_ckpt
+                    bridge_chosen_stage = None
+                    bridge_selection_source = "fallback_stagec"
+                    print(
+                        "[WARN] Bridge had no promoted stage; falling back to "
+                        f"Stage C checkpoint: {dual_start_ckpt}",
+                        flush=True,
+                    )
+                elif no_promotion_action == "fallback_stageb":
+                    dual_start_ckpt = stageb_ckpt
+                    bridge_chosen_stage = None
+                    bridge_selection_source = "fallback_stageb"
+                    print(
+                        "[WARN] Bridge had no promoted stage; falling back to "
+                        f"Stage B checkpoint: {dual_start_ckpt}",
+                        flush=True,
+                    )
+                else:
+                    # Legacy behavior: continue from the last bridge stage even if it failed gate.
+                    stages = bridge_manifest_for_summary.get("stages", [])
+                    if not stages:
+                        raise RuntimeError(
+                            "Bridge manifest contains no stage records; cannot continue from last "
+                            "stage when --bridge_no_promotion_action=continue_last."
+                        ) from err
+                    chosen = stages[-1]
+                    ckpt_dir = chosen.get("ckpt_dir")
+                    if not ckpt_dir:
+                        raise RuntimeError(
+                            "Last bridge stage has no ckpt_dir; cannot continue with "
+                            "--bridge_no_promotion_action=continue_last."
+                        ) from err
+                    dual_start_ckpt = Path(str(ckpt_dir)).resolve()
+                    bridge_chosen_stage = chosen
+                    bridge_selection_source = "continue_last_unpromoted"
+                    print(
+                        "[WARN] Bridge had no promoted stage; continuing from the "
+                        f"last unpromoted bridge checkpoint: {dual_start_ckpt}",
+                        flush=True,
+                    )
+
+    print(
+        f"[DUAL START] source={bridge_selection_source} checkpoint={dual_start_ckpt}",
+        flush=True,
+    )
 
     # 2) Dual-obstacle training
     dual_overrides = _dual_overrides(args)
@@ -485,6 +570,9 @@ def main() -> int:
             "manifest_path": str(bridge_manifest_path),
             "mode": args.bridge_mode,
             "initial_stage": args.bridge_initial_stage,
+            "no_promotion_action": args.bridge_no_promotion_action,
+            "selection_source": bridge_selection_source,
+            "selection_note": bridge_selection_note,
             "selected_stage": bridge_chosen_stage,
             "manifest": bridge_manifest_for_summary,
         },

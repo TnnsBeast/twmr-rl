@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J twmr-full
 #SBATCH -p gpu
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=120G
 #SBATCH -t 24:00:00
