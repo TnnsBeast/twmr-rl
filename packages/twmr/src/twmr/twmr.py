@@ -11,6 +11,16 @@ from mujoco_playground import MjxEnv, State, dm_control_suite
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.dm_control_suite import common
 
+# Current status:
+# - During individual phase training, the robot was able to pass a height of
+#   0.065, but the first run of the full curriculum only reached 0.045.
+# - The robot learns to extend its legs on top of an obstacle, even if the
+#   obstacle is very long.
+# - The robot does not learn to retract its legs completely after passing an
+#   obstacle.
+#
+# All of the above should be fixable with proper reward function tuning.
+
 ConfigOverridesDict = dict[str, str | int | float | bool | list | None]
 _ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
 _XML_BY_VARIANT = {
