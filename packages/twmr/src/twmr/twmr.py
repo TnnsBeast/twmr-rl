@@ -35,6 +35,13 @@ _XML_BY_VARIANT = {
     "terrain_sphere": "trans_wheel_robo2_2GEN_TERR.xml",
 }
 
+_OBSERVATION_MODE_STATE = "state"
+_OBSERVATION_MODE_IMU_ENCODER = "imu_encoder"
+_ACTION_MODE_DIRECT = "direct_motor_ctrl"
+_ACTION_MODE_VELOCITY_SETPOINT = "velocity_setpoint"
+_IMU_ACCELEROMETER_SENSOR_NAME = "root_acc"
+_IMU_GYRO_SENSOR_NAME = "root_gyro"
+
 
 def _resolve_xml_path(xml_variant: str) -> Path:
     xml_name = _XML_BY_VARIANT.get(xml_variant)
@@ -89,6 +96,19 @@ def default_config() -> config_dict.ConfigDict:
         impl="warp",  # TODO: cartpole uses jax
         nconmax=100,  # allow collisions
         njmax=500,  # allow complex joints
+        observation_mode=_OBSERVATION_MODE_STATE,
+        action_mode=_ACTION_MODE_DIRECT,
+        wheel_velocity_limit=20.0,
+        extension_velocity_limit=10.0,
+        wheel_velocity_kp=1.0,
+        extension_velocity_kp=1.0,
+        wheel_encoder_noise_std=0.0,
+        extension_encoder_noise_std=0.0,
+        extension_position_noise_std=0.0,
+        imu_acc_noise_std=0.0,
+        imu_gyro_noise_std=0.0,
+        imu_acc_bias_std=0.0,
+        imu_gyro_bias_std=0.0,
         forward_reward_weight=1.0,
         progress_delta_reward_weight=5.0,
         survival_reward=0.02,
@@ -189,6 +209,12 @@ class TransformableWheelMobileRobot(MjxEnv):
     def _maybe_get_joint_id(self, joint_name: str) -> int | None:
         try:
             return self._mj_model.joint(joint_name).id
+        except KeyError:
+            return None
+
+    def _maybe_get_sensor_id(self, sensor_name: str) -> int | None:
+        try:
+            return self._mj_model.sensor(sensor_name).id
         except KeyError:
             return None
 
@@ -516,50 +542,164 @@ class TransformableWheelMobileRobot(MjxEnv):
             raise ValueError(
                 "Could not resolve required root joint/body indices in the TWMR model."
             ) from err
-        self._extension_actuator_ids = tuple(
-            i for i in range(self._mj_model.nu) if "_extension_" in self._mj_model.actuator(i).name
-        )
-        self._extension_actuator_idx = jp.array(self._extension_actuator_ids, dtype=jp.int32)
-        self._has_extension_actuators = bool(self._extension_actuator_ids)
-        self._extension_retract_ctrl = jp.array(
-            [float(self._mj_model.actuator_ctrlrange[i, 0]) for i in self._extension_actuator_ids],
-            dtype=jp.float32,
-        )
+
+        self._observation_mode = str(self._config.observation_mode)
+        self._action_mode = str(self._config.action_mode)
+        if self._observation_mode not in {
+            _OBSERVATION_MODE_STATE,
+            _OBSERVATION_MODE_IMU_ENCODER,
+        }:
+            raise ValueError(
+                "Unsupported observation_mode "
+                f"{self._observation_mode!r}; expected one of "
+                f"{_OBSERVATION_MODE_STATE!r}, {_OBSERVATION_MODE_IMU_ENCODER!r}."
+            )
+        if self._action_mode not in {
+            _ACTION_MODE_DIRECT,
+            _ACTION_MODE_VELOCITY_SETPOINT,
+        }:
+            raise ValueError(
+                "Unsupported action_mode "
+                f"{self._action_mode!r}; expected one of "
+                f"{_ACTION_MODE_DIRECT!r}, {_ACTION_MODE_VELOCITY_SETPOINT!r}."
+            )
+
+        actuator_ctrl_low: list[float] = []
+        actuator_ctrl_high: list[float] = []
+        actuator_joint_dof_adrs: list[int] = []
+        wheel_actuator_ids: list[int] = []
+        extension_actuator_ids: list[int] = []
+        velocity_action_limits: list[float] = []
+        velocity_action_kps: list[float] = []
+
         # Cache actuated extension joint qpos indices and "fully retracted"
         # setpoints so episode reset can enforce a consistent starting geometry.
         extension_joint_qpos_adrs: list[int] = []
         extension_joint_dof_adrs: list[int] = []
         extension_joint_retracted_qpos: list[float] = []
+        extension_joint_center_qpos: list[float] = []
+        extension_joint_half_range: list[float] = []
         extension_joint_range_span: list[float] = []
         seen_extension_joint_ids: set[int] = set()
-        for actuator_id in self._extension_actuator_ids:
+        for actuator_id in range(self._mj_model.nu):
+            actuator_name = self._mj_model.actuator(actuator_id).name
             joint_id = int(self._mj_model.actuator_trnid[actuator_id, 0])
-            if joint_id < 0 or joint_id in seen_extension_joint_ids:
+            if joint_id < 0:
+                raise ValueError(
+                    "Each actuator must target a joint for the TWMR action interface. "
+                    f"Actuator {actuator_name!r} has joint id {joint_id}."
+                )
+            actuator_ctrl_low.append(float(self._mj_model.actuator_ctrlrange[actuator_id, 0]))
+            actuator_ctrl_high.append(float(self._mj_model.actuator_ctrlrange[actuator_id, 1]))
+            actuator_joint_dof_adrs.append(int(self._mj_model.jnt_dofadr[joint_id]))
+
+            is_extension_actuator = "_extension_" in actuator_name
+            if is_extension_actuator:
+                extension_actuator_ids.append(actuator_id)
+                velocity_action_limits.append(float(self._config.extension_velocity_limit))
+                velocity_action_kps.append(float(self._config.extension_velocity_kp))
+            else:
+                wheel_actuator_ids.append(actuator_id)
+                velocity_action_limits.append(float(self._config.wheel_velocity_limit))
+                velocity_action_kps.append(float(self._config.wheel_velocity_kp))
+
+            if not is_extension_actuator or joint_id in seen_extension_joint_ids:
                 continue
             seen_extension_joint_ids.add(joint_id)
             qpos_adr = int(self._mj_model.jnt_qposadr[joint_id])
             dof_adr = int(self._mj_model.jnt_dofadr[joint_id])
             if bool(self._mj_model.jnt_limited[joint_id]):
-                retracted_qpos = float(self._mj_model.jnt_range[joint_id, 0])
-                range_span = max(
-                    float(self._mj_model.jnt_range[joint_id, 1]) - retracted_qpos,
-                    1e-6,
-                )
+                range_lo = float(self._mj_model.jnt_range[joint_id, 0])
+                range_hi = float(self._mj_model.jnt_range[joint_id, 1])
+                retracted_qpos = range_lo
+                range_span = max(range_hi - range_lo, 1e-6)
+                center_qpos = 0.5 * (range_lo + range_hi)
+                half_range = max(0.5 * (range_hi - range_lo), 1e-6)
             else:
                 retracted_qpos = float(self._mj_model.qpos0[qpos_adr])
                 range_span = 1.0
+                center_qpos = retracted_qpos
+                half_range = 1.0
             extension_joint_qpos_adrs.append(qpos_adr)
             extension_joint_dof_adrs.append(dof_adr)
             extension_joint_retracted_qpos.append(retracted_qpos)
+            extension_joint_center_qpos.append(center_qpos)
+            extension_joint_half_range.append(half_range)
             extension_joint_range_span.append(range_span)
+        self._wheel_actuator_ids = tuple(wheel_actuator_ids)
+        self._wheel_actuator_idx = jp.array(self._wheel_actuator_ids, dtype=jp.int32)
+        self._wheel_joint_qvel_idx = jp.array(
+            [actuator_joint_dof_adrs[i] for i in self._wheel_actuator_ids],
+            dtype=jp.int32,
+        )
+        self._extension_actuator_ids = tuple(extension_actuator_ids)
+        self._extension_actuator_idx = jp.array(self._extension_actuator_ids, dtype=jp.int32)
+        self._has_extension_actuators = bool(self._extension_actuator_ids)
+        self._extension_retract_ctrl = jp.array(
+            [actuator_ctrl_low[i] for i in self._extension_actuator_ids],
+            dtype=jp.float32,
+        )
+        self._extension_hold_action = (
+            self._extension_retract_ctrl
+            if self._action_mode == _ACTION_MODE_DIRECT
+            else jp.zeros((len(self._extension_actuator_ids),), dtype=jp.float32)
+        )
+        self._actuator_ctrl_low_arr = jp.array(actuator_ctrl_low, dtype=jp.float32)
+        self._actuator_ctrl_high_arr = jp.array(actuator_ctrl_high, dtype=jp.float32)
+        self._actuator_joint_qvel_idx = jp.array(actuator_joint_dof_adrs, dtype=jp.int32)
+        self._velocity_action_limit_arr = jp.array(velocity_action_limits, dtype=jp.float32)
+        self._velocity_action_kp_arr = jp.array(velocity_action_kps, dtype=jp.float32)
         self._extension_joint_qpos_adrs = tuple(extension_joint_qpos_adrs)
         self._extension_joint_dof_adrs = tuple(extension_joint_dof_adrs)
         self._extension_joint_retracted_qpos = tuple(extension_joint_retracted_qpos)
         self._extension_joint_qpos_idx = jp.array(self._extension_joint_qpos_adrs, dtype=jp.int32)
+        self._extension_joint_dof_idx = jp.array(self._extension_joint_dof_adrs, dtype=jp.int32)
         self._extension_joint_retracted_qpos_arr = jp.array(
             self._extension_joint_retracted_qpos, dtype=jp.float32
         )
+        self._extension_joint_center_qpos_arr = jp.array(
+            extension_joint_center_qpos, dtype=jp.float32
+        )
+        self._extension_joint_half_range_arr = jp.array(
+            extension_joint_half_range, dtype=jp.float32
+        )
         self._extension_joint_range_span_arr = jp.array(extension_joint_range_span, dtype=jp.float32)
+        self._wheel_encoder_noise_std = float(self._config.wheel_encoder_noise_std)
+        self._extension_encoder_noise_std = float(self._config.extension_encoder_noise_std)
+        self._extension_position_noise_std = float(self._config.extension_position_noise_std)
+        self._imu_acc_noise_std = float(self._config.imu_acc_noise_std)
+        self._imu_gyro_noise_std = float(self._config.imu_gyro_noise_std)
+        self._imu_acc_bias_std = float(self._config.imu_acc_bias_std)
+        self._imu_gyro_bias_std = float(self._config.imu_gyro_bias_std)
+        self._control_dt = jp.array(float(self._config.ctrl_dt), dtype=jp.float32)
+        self._gravity_world = jp.array([0.0, 0.0, -9.81], dtype=jp.float32)
+
+        imu_acc_sensor_id = self._maybe_get_sensor_id(_IMU_ACCELEROMETER_SENSOR_NAME)
+        if imu_acc_sensor_id is not None:
+            imu_acc_dim = int(self._mj_model.sensor_dim[imu_acc_sensor_id])
+            if imu_acc_dim != 3:
+                raise ValueError(
+                    f"Expected 3D IMU accelerometer sensor, got dim={imu_acc_dim}."
+                )
+            imu_acc_adr = int(self._mj_model.sensor_adr[imu_acc_sensor_id])
+            self._imu_acc_sensor_idx = jp.arange(
+                imu_acc_adr, imu_acc_adr + imu_acc_dim, dtype=jp.int32
+            )
+        else:
+            self._imu_acc_sensor_idx = None
+
+        imu_gyro_sensor_id = self._maybe_get_sensor_id(_IMU_GYRO_SENSOR_NAME)
+        if imu_gyro_sensor_id is not None:
+            imu_gyro_dim = int(self._mj_model.sensor_dim[imu_gyro_sensor_id])
+            if imu_gyro_dim != 3:
+                raise ValueError(f"Expected 3D IMU gyro sensor, got dim={imu_gyro_dim}.")
+            imu_gyro_adr = int(self._mj_model.sensor_adr[imu_gyro_sensor_id])
+            self._imu_gyro_sensor_idx = jp.arange(
+                imu_gyro_adr, imu_gyro_adr + imu_gyro_dim, dtype=jp.int32
+            )
+        else:
+            self._imu_gyro_sensor_idx = None
+
         nominal_root_height = float(self._mj_model.body(self._root_body_id).pos[2])
         # Keep failure height below nominal spawn height so episodes do not terminate immediately.
         self._effective_min_base_height = min(
@@ -733,8 +873,26 @@ class TransformableWheelMobileRobot(MjxEnv):
             info["episode_geom_pos"] = model.geom_pos
             if self._obstacle_site_id is not None:
                 info["episode_site_pos"] = model.site_pos
+        if self._imu_acc_bias_std > 0.0:
+            rng, imu_acc_bias_rng = jax.random.split(rng)
+            info["imu_acc_bias"] = (
+                self._imu_acc_bias_std
+                * jax.random.normal(imu_acc_bias_rng, shape=(3,), dtype=jp.float32)
+            )
+        else:
+            info["imu_acc_bias"] = jp.zeros((3,), dtype=jp.float32)
+        if self._imu_gyro_bias_std > 0.0:
+            rng, imu_gyro_bias_rng = jax.random.split(rng)
+            info["imu_gyro_bias"] = (
+                self._imu_gyro_bias_std
+                * jax.random.normal(imu_gyro_bias_rng, shape=(3,), dtype=jp.float32)
+            )
+        else:
+            info["imu_gyro_bias"] = jp.zeros((3,), dtype=jp.float32)
+        info["prev_root_lin_vel"] = data.qvel[self._root_qvel_adr : self._root_qvel_adr + 3]
+        info["rng"] = rng
 
-        obs = self._get_obs(data, info)
+        obs, info = self._get_obs(data, info)
 
         return mjx_env.State(
             data=data,
@@ -752,7 +910,9 @@ class TransformableWheelMobileRobot(MjxEnv):
             and bool(self._config.freeze_extensions_when_no_obstacle)  # type: ignore
             and self._has_extension_actuators
         ):
-            action = action.at[self._extension_actuator_idx].set(self._extension_retract_ctrl)
+            action = action.at[self._extension_actuator_idx].set(self._extension_hold_action)
+
+        applied_ctrl = self._action_to_ctrl(state.data, action)
 
         episode_obstacle_height = state.info.get(
             "episode_obstacle_height", jp.array(self._obstacle_height, dtype=jp.float32)
@@ -779,7 +939,7 @@ class TransformableWheelMobileRobot(MjxEnv):
                     geom_size=episode_geom_size,
                     geom_pos=episode_geom_pos,
                 )
-        data = mjx_env.step(model, state.data, action, self.n_substeps)
+        data = mjx_env.step(model, state.data, applied_ctrl, self.n_substeps)
 
         # Keep randomized obstacle layouts fixed during the episode.
         obstacle_layout_locked = False
@@ -931,7 +1091,7 @@ class TransformableWheelMobileRobot(MjxEnv):
         forward_reward = self._config.forward_reward_weight * root_vx  # type: ignore
         progress_delta_reward = self._config.progress_delta_reward_weight * delta_x  # type: ignore
         survival_reward = jp.array(self._config.survival_reward, dtype=jp.float32)  # type: ignore
-        control_penalty = self._config.control_cost_weight * jp.sum(jp.square(action))  # type: ignore
+        control_penalty = self._config.control_cost_weight * jp.sum(jp.square(applied_ctrl))  # type: ignore
         lateral_penalty = self._config.lateral_velocity_cost_weight * jp.square(root_vy)  # type: ignore
         tilt_penalty = self._config.tilt_cost_weight * jp.maximum(0.0, 1.0 - upright)  # type: ignore
         backward_velocity_penalty = self._config.backward_velocity_cost_weight * backward_vx  # type: ignore
@@ -1014,7 +1174,7 @@ class TransformableWheelMobileRobot(MjxEnv):
             + success_bonus
         )
 
-        obs = self._get_obs(data, state.info)
+        obs, info = self._get_obs(data, state.info)
         done = (failure | (success & terminate_on_success)).astype(jp.float32)
 
         metrics = state.metrics.copy()
@@ -1076,8 +1236,8 @@ class TransformableWheelMobileRobot(MjxEnv):
         metrics["task/failure_nan"] = failure_nan.astype(jp.float32)
         metrics["task/done"] = done
 
-        info = state.info.copy()
         info["prev_root_x"] = root_x
+        info["prev_root_lin_vel"] = data.qvel[self._root_qvel_adr : self._root_qvel_adr + 3]
 
         return mjx_env.State(
             data=data,
@@ -1088,11 +1248,107 @@ class TransformableWheelMobileRobot(MjxEnv):
             info=info,
         )
 
-    def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> JaxArray:
-        # TODO: center of mass dynamics
-        qpos = data.qpos[self._obs_qpos_idx]
-        qvel = data.qvel[self._obs_qvel_idx]
-        return jp.concatenate([qpos, qvel])
+    def _action_to_ctrl(self, data: mjx.Data, action: JaxArray) -> JaxArray:
+        if self._action_mode == _ACTION_MODE_DIRECT:
+            return action
+
+        desired_velocity = jp.clip(
+            action, -self._velocity_action_limit_arr, self._velocity_action_limit_arr
+        )
+        measured_velocity = data.qvel[self._actuator_joint_qvel_idx]
+        ctrl = self._velocity_action_kp_arr * (desired_velocity - measured_velocity)
+        return jp.clip(ctrl, self._actuator_ctrl_low_arr, self._actuator_ctrl_high_arr)
+
+    @staticmethod
+    def _quat_conjugate(quat: JaxArray) -> JaxArray:
+        return jp.array([quat[0], -quat[1], -quat[2], -quat[3]], dtype=jp.float32)
+
+    @staticmethod
+    def _quat_multiply(lhs: JaxArray, rhs: JaxArray) -> JaxArray:
+        return jp.array(
+            [
+                lhs[0] * rhs[0] - lhs[1] * rhs[1] - lhs[2] * rhs[2] - lhs[3] * rhs[3],
+                lhs[0] * rhs[1] + lhs[1] * rhs[0] + lhs[2] * rhs[3] - lhs[3] * rhs[2],
+                lhs[0] * rhs[2] - lhs[1] * rhs[3] + lhs[2] * rhs[0] + lhs[3] * rhs[1],
+                lhs[0] * rhs[3] + lhs[1] * rhs[2] - lhs[2] * rhs[1] + lhs[3] * rhs[0],
+            ],
+            dtype=jp.float32,
+        )
+
+    def _rotate_world_to_body(self, root_quat: JaxArray, world_vec: JaxArray) -> JaxArray:
+        vec_quat = jp.concatenate(
+            [jp.zeros((1,), dtype=jp.float32), jp.asarray(world_vec, dtype=jp.float32)]
+        )
+        quat_conj = self._quat_conjugate(root_quat)
+        rotated = self._quat_multiply(self._quat_multiply(quat_conj, vec_quat), root_quat)
+        return rotated[1:]
+
+    def _get_imu_acc(self, data: mjx.Data, info: dict[str, Any]) -> JaxArray:
+        sensordata = getattr(data, "sensordata", None)
+        if sensordata is not None and self._imu_acc_sensor_idx is not None:
+            return sensordata[self._imu_acc_sensor_idx]
+
+        root_lin_vel = data.qvel[self._root_qvel_adr : self._root_qvel_adr + 3]
+        prev_root_lin_vel = info.get("prev_root_lin_vel", root_lin_vel)
+        root_lin_acc_world = (root_lin_vel - prev_root_lin_vel) / self._control_dt
+        proper_acc_world = root_lin_acc_world - self._gravity_world
+        root_quat = data.qpos[self._root_qpos_adr + 3 : self._root_qpos_adr + 7]
+        return self._rotate_world_to_body(root_quat, proper_acc_world)
+
+    def _get_imu_gyro(self, data: mjx.Data) -> JaxArray:
+        sensordata = getattr(data, "sensordata", None)
+        if sensordata is not None and self._imu_gyro_sensor_idx is not None:
+            return sensordata[self._imu_gyro_sensor_idx]
+        return data.qvel[self._root_qvel_adr + 3 : self._root_qvel_adr + 6]
+
+    def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> tuple[JaxArray, dict[str, Any]]:
+        next_info = info.copy()
+        if self._observation_mode == _OBSERVATION_MODE_STATE:
+            qpos = data.qpos[self._obs_qpos_idx]
+            qvel = data.qvel[self._obs_qvel_idx]
+            return jp.concatenate([qpos, qvel]), next_info
+
+        wheel_omega = data.qvel[self._wheel_joint_qvel_idx]
+        leg_omega = data.qvel[self._extension_joint_dof_idx]
+        leg_angles = data.qpos[self._extension_joint_qpos_idx]
+        imu_acc = self._get_imu_acc(data, next_info) + next_info.get(
+            "imu_acc_bias", jp.zeros((3,), dtype=jp.float32)
+        )
+        imu_gyro = self._get_imu_gyro(data) + next_info.get(
+            "imu_gyro_bias", jp.zeros((3,), dtype=jp.float32)
+        )
+
+        rng = next_info.get("rng")
+        if rng is not None:
+            rng, wheel_key, leg_key, angle_key, acc_key, gyro_key = jax.random.split(rng, 6)
+            next_info["rng"] = rng
+            if self._wheel_encoder_noise_std > 0.0:
+                wheel_omega = wheel_omega + self._wheel_encoder_noise_std * jax.random.normal(
+                    wheel_key, shape=wheel_omega.shape, dtype=jp.float32
+                )
+            if self._extension_encoder_noise_std > 0.0:
+                leg_omega = leg_omega + self._extension_encoder_noise_std * jax.random.normal(
+                    leg_key, shape=leg_omega.shape, dtype=jp.float32
+                )
+            if self._extension_position_noise_std > 0.0:
+                leg_angles = leg_angles + self._extension_position_noise_std * jax.random.normal(
+                    angle_key, shape=leg_angles.shape, dtype=jp.float32
+                )
+            if self._imu_acc_noise_std > 0.0:
+                imu_acc = imu_acc + self._imu_acc_noise_std * jax.random.normal(
+                    acc_key, shape=imu_acc.shape, dtype=jp.float32
+                )
+            if self._imu_gyro_noise_std > 0.0:
+                imu_gyro = imu_gyro + self._imu_gyro_noise_std * jax.random.normal(
+                    gyro_key, shape=imu_gyro.shape, dtype=jp.float32
+                )
+
+        leg_ext_norm = (leg_angles - self._extension_joint_center_qpos_arr) / (
+            self._extension_joint_half_range_arr
+        )
+        leg_ext_norm = jp.clip(leg_ext_norm, -1.0, 1.0)
+        obs = jp.concatenate([wheel_omega, leg_omega, leg_ext_norm, imu_acc, imu_gyro])
+        return obs, next_info
 
     def _compute_upright(self, root_quat: JaxArray) -> JaxArray:
         # MuJoCo quaternions are [w, x, y, z]. R[2,2] measures world-aligned up.

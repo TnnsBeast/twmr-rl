@@ -12,6 +12,24 @@
 
 This script is part of [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground). We should occasionally look for updates to the script. When we update the script we need to add `import twmr` to the top.
 
+## Hardware-Faithful IMU Curriculum
+
+To run the full curriculum with the packaged IMU + encoder observation path and
+velocity-setpoint action interface, use:
+
+```bash
+./.venv/bin/python scripts/neil-twmr-imu.py
+```
+
+This wrapper reuses the existing curriculum logic in
+`scripts/neil-twmr.py` and injects common overrides for:
+
+- `observation_mode=imu_encoder`
+- `action_mode=velocity_setpoint`
+
+You can use the dedicated HPC job wrapper at
+`jobs/train_neil_twmr_imu.sbatch`.
+
 ## Development Workflow
 
 ### Prerequisites

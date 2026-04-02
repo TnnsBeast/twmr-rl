@@ -126,6 +126,17 @@ def _run_cmd(cmd: list[str], env: dict[str, str], dry_run: bool) -> None:
     subprocess.run(cmd, check=True, env=env)
 
 
+def _merge_overrides(
+    overrides: dict[str, Any],
+    common_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    if not common_overrides:
+        return dict(overrides)
+    merged = dict(overrides)
+    merged.update(common_overrides)
+    return merged
+
+
 def _latest_log_with_suffix(logs_root: Path, suffix: str) -> Path:
     candidates = [path for path in logs_root.iterdir() if path.is_dir() and path.name.endswith(f"-{suffix}")]
     if not candidates:
@@ -422,10 +433,11 @@ def _train_single_stage(
     phase_title: str,
     dry_run: bool,
 ) -> dict[str, Any]:
+    merged_overrides = _merge_overrides(overrides, args.common_overrides)
     train_cmd = _train_cmd(
         python_exec=args.python,
         suffix=suffix,
-        overrides=overrides,
+        overrides=merged_overrides,
         params=params,
         load_checkpoint_path=load_checkpoint_path,
     )
@@ -436,7 +448,7 @@ def _train_single_stage(
         "suffix": suffix,
         "restore_from": str(load_checkpoint_path) if load_checkpoint_path is not None else "",
         "train_params": asdict(params),
-        "overrides": overrides,
+        "overrides": merged_overrides,
     }
     if dry_run:
         record["dry_run"] = True
@@ -647,19 +659,20 @@ def _run_bridge_phase(
         train_cmd = _train_cmd(
             python_exec=args.python,
             suffix=stage.suffix,
-            overrides=stage.overrides,
+            overrides=_merge_overrides(stage.overrides, args.common_overrides),
             params=params,
             load_checkpoint_path=checkpoint_from_prev_stage,
         )
         _run_cmd(train_cmd, env=env, dry_run=dry_run)
 
+        merged_overrides = _merge_overrides(stage.overrides, args.common_overrides)
         record: dict[str, Any] = {
             "stage_index": stage.index,
             "height": stage.height,
             "half_length": stage.half_length,
             "suffix": stage.suffix,
             "restore_from": str(checkpoint_from_prev_stage),
-            "overrides": stage.overrides,
+            "overrides": merged_overrides,
         }
         if dry_run:
             record["dry_run"] = True
@@ -687,7 +700,7 @@ def _run_bridge_phase(
         eval_cmd = _eval_cmd(
             python_exec=args.python,
             checkpoint_path=ckpt_dir,
-            overrides=stage.overrides,
+            overrides=merged_overrides,
             params=params,
             eval_num_episodes=args.bridge_eval_num_episodes,
             eval_batch_size=args.bridge_eval_batch_size,
@@ -789,12 +802,13 @@ def _run_random_phase(
         train_cmd = _train_cmd(
             python_exec=args.python,
             suffix=stage.suffix,
-            overrides=stage.overrides,
+            overrides=_merge_overrides(stage.overrides, args.common_overrides),
             params=params,
             load_checkpoint_path=checkpoint_from_prev_stage,
         )
         _run_cmd(train_cmd, env=env, dry_run=dry_run)
 
+        merged_overrides = _merge_overrides(stage.overrides, args.common_overrides)
         record: dict[str, Any] = {
             "stage_index": stage.index,
             "scenario_index": stage.scenario_index,
@@ -803,7 +817,7 @@ def _run_random_phase(
             "obstacle_half_length": stage.obstacle_half_length,
             "suffix": stage.suffix,
             "restore_from": str(checkpoint_from_prev_stage),
-            "overrides": stage.overrides,
+            "overrides": merged_overrides,
         }
         if dry_run:
             record["dry_run"] = True
@@ -838,7 +852,7 @@ def _run_random_phase(
         eval_cmd = _eval_cmd(
             python_exec=args.python,
             checkpoint_path=ckpt_dir,
-            overrides=stage.overrides,
+            overrides=merged_overrides,
             params=params,
             eval_num_episodes=args.random_eval_num_episodes,
             eval_batch_size=args.random_eval_batch_size,
@@ -965,6 +979,14 @@ def _parse_args() -> argparse.Namespace:
         help="Required for simpleobstacle, bridge, and random single-phase runs.",
     )
     parser.add_argument("--manifest_path", default=None)
+    parser.add_argument(
+        "--common_overrides_json",
+        default="{}",
+        help=(
+            "JSON dict of environment config overrides merged into every curriculum "
+            "stage after the stage-specific overrides are constructed."
+        ),
+    )
     parser.add_argument("--dry_run", action="store_true")
 
     parser.add_argument("--flat_num_timesteps", type=int, default=2_000_000)
@@ -1076,6 +1098,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    common_overrides = json.loads(args.common_overrides_json)
+    if not isinstance(common_overrides, dict):
+        raise ValueError("--common_overrides_json must decode to a JSON object.")
+    args.common_overrides = common_overrides
     logs_root = Path("logs").resolve()
     logs_root.mkdir(parents=True, exist_ok=True)
     env = _runtime_env()
@@ -1097,6 +1123,7 @@ def main() -> int:
         manifest = {
             "created_at": dt.datetime.now().isoformat(),
             "phase": PHASE_FLAT,
+            "common_overrides": args.common_overrides,
             "result": result,
         }
     elif args.phase == PHASE_SIMPLE:
@@ -1117,6 +1144,7 @@ def main() -> int:
             "created_at": dt.datetime.now().isoformat(),
             "phase": PHASE_SIMPLE,
             "initial_checkpoint_path": str(initial_checkpoint),
+            "common_overrides": args.common_overrides,
             "result": result,
         }
     elif args.phase == PHASE_BRIDGE:
@@ -1132,6 +1160,7 @@ def main() -> int:
         manifest = {
             "created_at": dt.datetime.now().isoformat(),
             "phase": PHASE_BRIDGE,
+            "common_overrides": args.common_overrides,
             "result": bridge_result,
         }
     elif args.phase == PHASE_RANDOM:
@@ -1147,6 +1176,7 @@ def main() -> int:
         manifest = {
             "created_at": dt.datetime.now().isoformat(),
             "phase": PHASE_RANDOM,
+            "common_overrides": args.common_overrides,
             "result": random_result,
         }
     else:
@@ -1222,6 +1252,7 @@ def main() -> int:
                     "Copied from the successful individual flat/simpleobstacle/bridge/random jobs."
                 ),
             },
+            "common_overrides": args.common_overrides,
             "flat": flat_result,
             "simpleobstacle": simple_result,
             "bridge": bridge_result,
